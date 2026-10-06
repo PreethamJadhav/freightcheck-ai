@@ -1,0 +1,57 @@
+# FreightCheck AI - validation rules
+#
+# This file decides WHICH checks run for each document type and HOW STRICT
+# they are. The code in validator.py contains no business numbers or policies;
+# change a rule here and the behaviour changes, no code edit needed.
+#
+# severity:
+#   reject  -> document is REJECTED outright
+#   review  -> document goes to NEEDS_REVIEW for a human
+# If no findings at all -> APPROVED.
+#
+# Available checks:
+#   has_po_reference        document must quote a PO number
+#   po_exists               the quoted PO must already be uploaded
+#   duplicate_document      same document number was processed before
+#   vendor_matches          vendor/shipper equals the PO vendor
+#   buyer_matches           buyer/consignee equals the PO buyer
+#   total_within_tolerance  total within tolerance_percent of the PO total
+#   line_items_match        items and quantities match the PO (check_prices: true/false)
+#   not_dated_before_po     document date is not earlier than the PO date
+
+invoice:
+  - check: has_po_reference
+    severity: reject
+  - check: duplicate_document
+    severity: reject
+  - check: po_exists
+    severity: review
+  - check: vendor_matches
+    severity: review
+  - check: buyer_matches
+    severity: review
+  - check: total_within_tolerance
+    severity: review
+    tolerance_percent: 2
+  - check: line_items_match
+    severity: review
+    check_prices: true
+  - check: not_dated_before_po
+    severity: review
+
+bill_of_lading:
+  - check: has_po_reference
+    severity: reject
+  - check: duplicate_document
+    severity: reject
+  - check: po_exists
+    severity: review
+  - check: vendor_matches
+    severity: review
+  - check: buyer_matches
+    severity: review
+  - check: line_items_match
+    severity: review
+    check_prices: false
+  - check: not_dated_before_po
+    severity: review

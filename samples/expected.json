@@ -1,0 +1,7 @@
+{
+  "INV-5001": "APPROVED - matches PO-1001",
+  "INV-5002": "NEEDS_REVIEW - total exceeds PO by 350 USD (extra handling charge)",
+  "INV-5003": "NEEDS_REVIEW - resistor qty 15000 vs 20000 ordered; total below PO",
+  "BL-9001": "APPROVED - matches PO-1001",
+  "BL-9002": "NEEDS_REVIEW - 38 pallets shipped vs 40 ordered"
+}
