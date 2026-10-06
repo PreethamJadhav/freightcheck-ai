@@ -1,4 +1,4 @@
-"""FreightCheck AI - backend (Day 2: upload -> extract -> VALIDATE -> store -> list).
+"""FreightCheck AI - backend (Day 3: upload -> extract -> validate -> HUMAN DECISION + AUDIT LOG).
 
 Run from the project root:
     uvicorn backend.main:app --reload
@@ -10,8 +10,11 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from typing import Literal, Optional
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from backend.extractor import ExtractedDoc, extract_document
 from backend.validator import load_rules, validate
@@ -62,9 +65,43 @@ def init_db():
                    FOREIGN KEY (document_id) REFERENCES documents (id)
                )"""
         )
+        # New in Day 3: an append-only record of everything that happens to a document
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS audit_log (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   document_id INTEGER NOT NULL,
+                   action TEXT NOT NULL,
+                   actor TEXT NOT NULL,
+                   comment TEXT,
+                   from_status TEXT,
+                   to_status TEXT,
+                   created_at TEXT NOT NULL,
+                   FOREIGN KEY (document_id) REFERENCES documents (id)
+               )"""
+        )
 
 
 init_db()
+
+HUMAN_DECISION_STATUSES = ("MANUALLY_APPROVED", "MANUALLY_REJECTED")
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log_audit(conn, doc_id, action, actor, comment=None, from_status=None, to_status=None):
+    conn.execute(
+        "INSERT INTO audit_log (document_id, action, actor, comment, from_status, to_status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (doc_id, action, actor, comment, from_status, to_status, now()),
+    )
+
+
+class DecisionIn(BaseModel):
+    action: Literal["approve", "reject"]
+    reviewer: str = Field(min_length=1, max_length=100)
+    comment: str = Field(min_length=3, max_length=1000)   # a reason is mandatory
 
 
 def run_validation(conn, doc_id: int) -> dict:
@@ -95,9 +132,13 @@ def run_validation(conn, doc_id: int) -> dict:
 
     conn.execute(
         "INSERT INTO validations (document_id, status, findings_json, created_at) VALUES (?, ?, ?, ?)",
-        (doc_id, result["status"], json.dumps(result["findings"]), datetime.now(timezone.utc).isoformat()),
+        (doc_id, result["status"], json.dumps(result["findings"]), now()),
     )
     conn.execute("UPDATE documents SET status = ? WHERE id = ?", (result["status"], doc_id))
+    n = len(result["findings"])
+    log_audit(conn, doc_id, "VALIDATED", "system",
+              comment=f"{n} finding(s)" if n else "no findings",
+              from_status=row["status"], to_status=result["status"])
     return result
 
 
@@ -133,10 +174,11 @@ async def upload_document(file: UploadFile = File(...)):
                 extracted.doc_type,
                 extracted.doc_number,
                 extracted.model_dump_json(),
-                datetime.now(timezone.utc).isoformat(),
+                now(),
             ),
         )
         doc_id = cur.lastrowid
+        log_audit(conn, doc_id, "UPLOADED", "system", comment=file.filename, to_status="EXTRACTED")
         validation = run_validation(conn, doc_id)
 
     return {"id": doc_id, "extracted": extracted.model_dump(), "validation": validation}
@@ -146,16 +188,55 @@ async def upload_document(file: UploadFile = File(...)):
 def revalidate_document(doc_id: int):
     """Run validation again, e.g. after the matching PO was uploaded or rules.yaml changed."""
     with db() as conn:
+        row = conn.execute("SELECT status FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if row and row["status"] in HUMAN_DECISION_STATUSES:
+            raise HTTPException(409, "A reviewer has already decided this document; it cannot be re-validated.")
         return {"id": doc_id, "validation": run_validation(conn, doc_id)}
 
 
-@app.get("/documents")
-def list_documents():
+@app.post("/documents/{doc_id}/decision")
+def decide_document(doc_id: int, decision: DecisionIn):
+    """A person approves or rejects a document the system flagged NEEDS_REVIEW."""
     with db() as conn:
+        row = conn.execute("SELECT status FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Document not found")
+        if row["status"] != "NEEDS_REVIEW":
+            raise HTTPException(
+                409, f"Only documents in NEEDS_REVIEW can be decided (this one is {row['status']})."
+            )
+        new_status = "MANUALLY_APPROVED" if decision.action == "approve" else "MANUALLY_REJECTED"
+        conn.execute("UPDATE documents SET status = ? WHERE id = ?", (new_status, doc_id))
+        action_name = "APPROVED" if decision.action == "approve" else "REJECTED"
+        log_audit(conn, doc_id, action_name,
+                  decision.reviewer, comment=decision.comment,
+                  from_status=row["status"], to_status=new_status)
+    return {"id": doc_id, "status": new_status}
+
+
+@app.get("/documents/{doc_id}/audit")
+def get_audit_trail(doc_id: int):
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM documents WHERE id = ?", (doc_id,)).fetchone():
+            raise HTTPException(404, "Document not found")
         rows = conn.execute(
-            "SELECT id, filename, doc_type, doc_number, status, created_at "
-            "FROM documents ORDER BY id DESC"
+            "SELECT action, actor, comment, from_status, to_status, created_at "
+            "FROM audit_log WHERE document_id = ? ORDER BY id",
+            (doc_id,),
         ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/documents")
+def list_documents(status: Optional[str] = None):
+    """All documents, newest first. Use ?status=NEEDS_REVIEW to get the review queue."""
+    query = ("SELECT id, filename, doc_type, doc_number, status, created_at FROM documents")
+    params = ()
+    if status:
+        query += " WHERE status = ?"
+        params = (status,)
+    with db() as conn:
+        rows = conn.execute(query + " ORDER BY id DESC", params).fetchall()
     return [dict(r) for r in rows]
 
 
